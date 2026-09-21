@@ -149,10 +149,25 @@ fn stream_tts(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
         }
     };
 
-    let content_type = response.header("Content-Type").unwrap_or("audio/mpeg");
+    let content_type = response.header("Content-Type").unwrap_or_default();
+    if !content_type.to_ascii_lowercase().contains("audio/mpeg")
+        && !content_type.to_ascii_lowercase().contains("audio/mp3")
+    {
+        return send_response(
+            stream,
+            Response::json(
+                "502 Bad Gateway",
+                &format!(
+                    "{{\"error\":\"TTS provider must return MP3 audio (audio/mpeg), received '{}'\"}}",
+                    escape_json(content_type)
+                ),
+            ),
+        );
+    }
+
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Disposition: inline; filename=tts.mp3\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n"
     )?;
 
     let mut reader = response.into_reader();

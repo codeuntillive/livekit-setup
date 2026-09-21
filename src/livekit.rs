@@ -1,5 +1,5 @@
-use livekit_api::access_token::{AccessToken, AccessTokenError, AudioGrants};
-use std::env;
+use livekit_api::access_token::{AccessToken, AccessTokenError, VideoGrants};
+use std::{env, time::Duration};
 
 /// Creates a short-lived token that allows the browser to join the configured room.
 pub fn create_token(identity: &str, room: &str) -> Result<String, AccessTokenError> {
@@ -9,8 +9,8 @@ pub fn create_token(identity: &str, room: &str) -> Result<String, AccessTokenErr
     AccessToken::with_api_key(&api_key, &api_secret)
         .with_identity(identity)
         .with_name(identity)
-        .with_ttl(3600)
-        .with_grants(AudioGrants {
+        .with_ttl(Duration::from_secs(3600))
+        .with_grants(VideoGrants {
             room_join: true,
             room: room.to_owned(),
             can_publish: true,
