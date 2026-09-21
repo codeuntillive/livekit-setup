@@ -1,0 +1,8 @@
+[package]
+name = "webs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+livekit = "0.9.1"
+ureq = { version = "2.12", default-features = false, features = ["json", "tls"] }
