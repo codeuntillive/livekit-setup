@@ -1,5 +1,0 @@
-LIVEKIT_API_KEY=API5QmUUY9ysy4E
-LIVEKIT_API_SECRET=TN3metz9hXNqFW27fnO0A3mevIDspxf3xVB9xSEsSM7D
-ADDRESS=127.0.0.1:7878
-LIVEKIT_ROOM=tts-room
-TTS_URL=https://your-tts-provider.example/synthesize
