@@ -1,4 +1,6 @@
+mod chunker;
 mod livekit;
+mod tts_pool;
 
 use std::{
     env,
@@ -53,6 +55,7 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
     match (method, path) {
         ("GET", "/token") => send_response(&mut stream, token_response()),
         ("POST", "/speak") => stream_tts(&mut stream, &body),
+        ("POST", "/chat") => handle_chat(&mut stream, &body),
         ("OPTIONS", _) => send_response(&mut stream, Response::empty("204 No Content")),
         _ => send_response(
             &mut stream,
@@ -103,8 +106,9 @@ fn token_response() -> Response {
     }
 }
 
-/// Calls the configured TTS service and forwards its response to React as HTTP chunks.
-/// The TTS service must return audio bytes (for example, audio/mpeg or audio/wav).
+/// Splits the input text into sentence-level chunks and synthesizes them in
+/// parallel using the TTS worker pool.  Audio shards are streamed back in order
+/// via HTTP chunked transfer encoding ("speak early, fill later").
 fn stream_tts(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
     let Some(text) = json_string_field(body, "text") else {
         return send_response(
@@ -132,58 +136,106 @@ fn stream_tts(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
         );
     };
 
-    let result = ureq::post(&tts_url)
-        .set("Content-Type", "application/json")
-        .send_json(ureq::json!({ "text": text }));
+    let chunks = chunker::chunk_text(&text);
+    println!("text split into {} chunk(s)", chunks.len());
 
-    let response = match result {
-        Ok(response) => response,
-        Err(error) => {
+    tts_pool::stream_parallel(stream, &chunks, &tts_url)
+}
+
+/// Orchestrator endpoint: accepts user text, calls the LLM to produce a
+/// response, then synthesizes it through the parallel TTS pipeline.
+///
+/// Architecture (from the "Voice stack: brain + TTS pool" diagram):
+///   User text → LLM orchestrator → response text → chunker → TTS pool → audio stream
+fn handle_chat(stream: &mut TcpStream, body: &str) -> std::io::Result<()> {
+    let Some(text) = json_string_field(body, "text") else {
+        return send_response(
+            stream,
+            Response::json(
+                "400 Bad Request",
+                "{\"error\":\"JSON field 'text' is required\"}",
+            ),
+        );
+    };
+    if text.trim().is_empty() {
+        return send_response(
+            stream,
+            Response::json("400 Bad Request", "{\"error\":\"text cannot be empty\"}"),
+        );
+    }
+
+    let Some(llm_url) = env::var("LLM_URL").ok().filter(|url| !url.is_empty()) else {
+        return send_response(
+            stream,
+            Response::json(
+                "500 Internal Server Error",
+                "{\"error\":\"LLM_URL is not configured\"}",
+            ),
+        );
+    };
+    let Some(tts_url) = env::var("TTS_URL").ok().filter(|url| !url.is_empty()) else {
+        return send_response(
+            stream,
+            Response::json(
+                "500 Internal Server Error",
+                "{\"error\":\"TTS_URL is not configured\"}",
+            ),
+        );
+    };
+
+    println!("chat: calling LLM …");
+    let llm_body = match ureq::post(&llm_url)
+        .set("Content-Type", "application/json")
+        .send_json(ureq::json!({ "text": text }))
+    {
+        Ok(resp) => match resp.into_string() {
+            Ok(s) => s,
+            Err(e) => {
+                return send_response(
+                    stream,
+                    Response::json(
+                        "502 Bad Gateway",
+                        &format!(
+                            "{{\"error\":\"LLM response read error: {}\"}}",
+                            escape_json(&e.to_string())
+                        ),
+                    ),
+                );
+            }
+        },
+        Err(e) => {
             return send_response(
                 stream,
                 Response::json(
                     "502 Bad Gateway",
-                    &format!("{{\"error\":\"{}\"}}", escape_json(&error.to_string())),
+                    &format!(
+                        "{{\"error\":\"LLM request failed: {}\"}}",
+                        escape_json(&e.to_string())
+                    ),
                 ),
             );
         }
     };
 
-    let content_type = response.header("Content-Type").unwrap_or_default();
-    if !content_type.to_ascii_lowercase().contains("audio/mpeg")
-        && !content_type.to_ascii_lowercase().contains("audio/mp3")
-    {
+    let Some(response_text) = json_string_field(&llm_body, "text") else {
         return send_response(
             stream,
             Response::json(
                 "502 Bad Gateway",
-                &format!(
-                    "{{\"error\":\"TTS provider must return MP3 audio (audio/mpeg), received '{}'\"}}",
-                    escape_json(content_type)
-                ),
+                "{\"error\":\"LLM response missing 'text' field\"}",
             ),
         );
-    }
+    };
 
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Disposition: inline; filename=tts.mp3\r\nTransfer-Encoding: chunked\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n"
-    )?;
+    println!(
+        "chat: LLM responded ({} chars), synthesizing …",
+        response_text.len()
+    );
 
-    let mut reader = response.into_reader();
-    let mut buffer = [0u8; 16 * 1024];
-    loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
-            break;
-        }
-        write!(stream, "{count:X}\r\n")?;
-        stream.write_all(&buffer[..count])?;
-        stream.write_all(b"\r\n")?;
-        stream.flush()?;
-    }
-    stream.write_all(b"0\r\n\r\n")?;
-    Ok(())
+    let chunks = chunker::chunk_text(&response_text);
+    println!("text split into {} chunk(s)", chunks.len());
+
+    tts_pool::stream_parallel(stream, &chunks, &tts_url)
 }
 
 fn send_response(stream: &mut TcpStream, response: Response) -> std::io::Result<()> {

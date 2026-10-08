@@ -1,43 +1,80 @@
-# LiveKit Text-to-Speech Streaming Server
+# LiveKit Parallel TTS Streaming Server
 
-A small Rust HTTP server for a React text-to-speech frontend.
+A Rust HTTP server that splits text into sentence-level chunks, synthesizes them through a TTS provider **in parallel**, and streams the ordered audio back to the client in real time.
 
-The application accepts text from the frontend, sends it to a configured TTS provider, and streams the returned MP3 audio back to the browser chunk by chunk. It also provides a LiveKit access-token endpoint so a React client can join the configured LiveKit room.
-
-## What it does
+## Architecture
 
 ```text
-React frontend
-     |
-     | POST /speak { "text": "..." }
-     v
-Rust server
-     |
-     | POST configured TTS_URL
-     v
-TTS provider
-     |
-     | audio/mpeg response
-     v
-Rust server streams MP3 chunks
-     |
-     v
-React frontend
+                         ┌──────────────────────────┐
+                         │   POST /speak or /chat    │
+                         └────────────┬─────────────┘
+                                      │
+                                      ▼
+                              ┌───────────────┐
+                              │   Chunker      │
+                              │ split on . ! ? │
+                              └───┬───┬───┬───┘
+                                  │   │   │
+                      ┌───────────┘   │   └───────────┐
+                      ▼               ▼               ▼
+               ┌────────────┐  ┌────────────┐  ┌────────────┐
+               │  Worker 1  │  │  Worker 2  │  │  Worker 3  │
+               │  TTS call  │  │  TTS call  │  │  TTS call  │
+               └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+                     │               │               │
+                     └───────┬───────┴───────┬───────┘
+                             │               │
+                             ▼               ▼
+                     ┌─────────────────────────────┐
+                     │       Ordered Buffer         │
+                     │  collect shards, flush in    │
+                     │  order as they become ready  │
+                     └──────────────┬──────────────┘
+                                    │
+                                    ▼
+                         HTTP chunked stream
+                         (audio/mpeg to client)
 ```
 
-The server does not store the generated audio. Audio is forwarded as it is received from the TTS provider.
+**Sequential** total time = `t₁ + t₂ + t₃`
+**Parallel** total time ≈ `max(t₁, t₂, t₃)`
+
+Chunks are produced in parallel but played in order. The ordered buffer streams each shard the moment the next-in-sequence shard is ready ("speak early, fill later").
+
+## Voice stack (brain + TTS pool)
+
+The `/chat` endpoint implements the full orchestrator flow from the voice stack architecture:
+
+```text
+User text ──▶ LLM orchestrator (LLM_URL) ──▶ response text
+                                                   │
+                                                   ▼
+                                             Parallel chunker
+                                                   │
+                                         ┌─────────┼─────────┐
+                                         ▼         ▼         ▼
+                                       TTS W1    TTS W2    TTS W3
+                                         │         │         │
+                                         └────┬────┴────┬────┘
+                                              ▼         ▼
+                                        Ordered buffer
+                                              │
+                                              ▼
+                                   Stream to client / LiveKit
+```
 
 ## Requirements
 
 - Rust and Cargo
 - A TTS provider that accepts JSON text and returns MP3 bytes
 - A LiveKit project if the `/token` endpoint is needed
+- An LLM endpoint if the `/chat` endpoint is needed
 
 The Rust project uses:
 
 - `livekit-api` for LiveKit access tokens
-- `ureq` for calling the TTS provider
-- A small HTTP server implemented with Rust's standard library
+- `ureq` for calling the TTS and LLM providers
+- `std::thread` worker pool for parallel TTS synthesis
 
 ## Installation
 
@@ -61,10 +98,12 @@ Set the environment variables before starting the server:
 
 ```bash
 export ADDRESS=127.0.0.1:7878
-export LIVEKIT_ROOM=tts-room
+export TTS_URL=https://your-tts-provider.example/synthesize
+export TTS_WORKERS=4
+export LLM_URL=https://your-llm-api.example/chat
 export LIVEKIT_API_KEY=your_livekit_api_key
 export LIVEKIT_API_SECRET=your_livekit_api_secret
-export TTS_URL=https://your-tts-provider.example/synthesize
+export LIVEKIT_ROOM=tts-room
 ```
 
 Start the server:
@@ -84,51 +123,37 @@ http://127.0.0.1:7878
 | Variable | Required | Description |
 |---|---:|---|
 | `ADDRESS` | No | Address and port to bind. Defaults to `127.0.0.1:7878`. |
-| `TTS_URL` | Yes for `/speak` | URL of the TTS provider endpoint. |
+| `TTS_URL` | Yes for `/speak` and `/chat` | URL of the TTS provider endpoint. |
+| `TTS_WORKERS` | No | Maximum concurrent TTS worker threads. Defaults to `4`. |
+| `LLM_URL` | Yes for `/chat` | URL of the LLM orchestrator endpoint. |
 | `LIVEKIT_API_KEY` | Yes for `/token` | LiveKit API key. |
 | `LIVEKIT_API_SECRET` | Yes for `/token` | LiveKit API secret. |
 | `LIVEKIT_ROOM` | No | LiveKit room name. Defaults to `tts-room`. |
 
 Never commit `LIVEKIT_API_SECRET` to Git.
 
-## TTS provider contract
+## How the parallel TTS pool works
 
-The Rust server sends this request to `TTS_URL`:
+1. **Chunker** (`src/chunker.rs`): splits the input text on sentence boundaries (`.` `!` `?` followed by whitespace or end of text).
 
-```http
-POST /synthesize
-Content-Type: application/json
-```
+2. **Worker pool** (`src/tts_pool.rs`): spawns up to `TTS_WORKERS` threads. Each worker grabs the next unprocessed chunk using an atomic counter (work-stealing pattern) and calls the TTS provider.
 
-```json
-{
-  "text": "Hello from React"
-}
-```
+3. **Ordered buffer**: workers send `(index, audio_bytes)` through a channel. The main thread keeps a `HashMap` buffer and flushes all consecutive ready shards to the HTTP stream as soon as the next expected index arrives.
 
-The provider must return MP3 audio bytes:
-
-```http
-HTTP/1.1 200 OK
-Content-Type: audio/mpeg
-```
-
-`audio/mp3` is also accepted.
-
-The provider can return the MP3 as a normal response body. The Rust server reads it and forwards it to the frontend using HTTP chunked transfer encoding.
+4. **Streaming**: audio is written to the client using HTTP chunked transfer encoding. Each shard is flushed immediately, so the client can begin playback before all chunks are synthesized.
 
 ## API endpoints
 
 ### `POST /speak`
 
-Converts text to MP3 audio and streams the result to the client.
+Splits text into chunks, synthesizes them in parallel, and streams the combined MP3 audio.
 
 Request:
 
 ```bash
 curl -N \
   -H "Content-Type: application/json" \
-  -d '{"text":"Hello from React"}' \
+  -d '{"text":"Hello from React. This is a test. How are you?"}' \
   http://127.0.0.1:7878/speak \
   -o output.mp3
 ```
@@ -142,19 +167,34 @@ Content-Disposition: inline; filename=tts.mp3
 Transfer-Encoding: chunked
 ```
 
-The response body is MP3 data, not JSON.
-
-Verify the downloaded file:
-
-```bash
-file output.mp3
-```
+The response body is MP3 data streamed in order as shards complete.
 
 Possible errors:
 
 - `400 Bad Request`: missing or empty `text`
-- `502 Bad Gateway`: the TTS provider failed or returned a non-MP3 response
 - `500 Internal Server Error`: `TTS_URL` is not configured
+
+### `POST /chat`
+
+Orchestrator endpoint. Sends user text to the LLM, then synthesizes the LLM response through the parallel TTS pipeline.
+
+Request:
+
+```bash
+curl -N \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Tell me about Rust programming"}' \
+  http://127.0.0.1:7878/chat \
+  -o response.mp3
+```
+
+The LLM must return `{"text": "..."}`. The response text is chunked and synthesized through the parallel TTS pool.
+
+Possible errors:
+
+- `400 Bad Request`: missing or empty `text`
+- `500 Internal Server Error`: `LLM_URL` or `TTS_URL` is not configured
+- `502 Bad Gateway`: the LLM request failed or returned an unexpected format
 
 ### `GET /token`
 
@@ -173,11 +213,51 @@ Example response:
 }
 ```
 
-The token allows the client to join the room and publish or subscribe to audio tracks. The server currently generates the token; the React application is responsible for using it to connect to LiveKit.
-
 ### `OPTIONS`
 
 CORS preflight requests are supported for browser clients.
+
+## TTS provider contract
+
+The server sends this request to `TTS_URL` for each chunk:
+
+```http
+POST /synthesize
+Content-Type: application/json
+```
+
+```json
+{
+  "text": "One sentence chunk."
+}
+```
+
+The provider must return MP3 audio bytes:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: audio/mpeg
+```
+
+`audio/mp3` is also accepted.
+
+## LLM provider contract
+
+The server sends this request to `LLM_URL`:
+
+```json
+{
+  "text": "User message"
+}
+```
+
+The provider must return:
+
+```json
+{
+  "text": "LLM response text that will be chunked and synthesized."
+}
+```
 
 ## React usage
 
@@ -187,9 +267,7 @@ CORS preflight requests are supported for browser clients.
 async function speak(text) {
   const response = await fetch("http://127.0.0.1:7878/speak", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
   });
 
@@ -198,74 +276,34 @@ async function speak(text) {
     throw new Error(error.error || `Request failed: ${response.status}`);
   }
 
-  // This downloads the complete MP3 after the stream finishes.
   const mp3Blob = await response.blob();
   const audioUrl = URL.createObjectURL(mp3Blob);
   const audio = new Audio(audioUrl);
   await audio.play();
-
-  audio.addEventListener("ended", () => {
-    URL.revokeObjectURL(audioUrl);
-  });
-}
-```
-
-Use it from a React component:
-
-```jsx
-function SpeakButton() {
-  const [loading, setLoading] = React.useState(false);
-
-  async function handleSpeak() {
-    setLoading(true);
-    try {
-      await speak("Hello from the React frontend");
-    } catch (error) {
-      console.error(error);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <button onClick={handleSpeak} disabled={loading}>
-      {loading ? "Generating..." : "Speak"}
-    </button>
-  );
+  audio.addEventListener("ended", () => URL.revokeObjectURL(audioUrl));
 }
 ```
 
 ### Read chunks as they arrive
 
-The browser receives the response as a stream:
-
 ```js
 async function readAudioChunks(text, onChunk) {
   const response = await fetch("http://127.0.0.1:7878/speak", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
   });
 
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
+  if (!response.ok) throw new Error(await response.text());
 
   const reader = response.body.getReader();
-
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-
-    // value is a Uint8Array containing the next MP3 bytes.
-    onChunk(value);
+    onChunk(value); // Uint8Array of MP3 bytes
   }
 }
 ```
-
-For reliable playback while chunks are arriving, use the browser `MediaSource` API with a codec supported by the returned MP3 stream. For simpler playback, collect the chunks into a `Blob` and create an object URL as shown above.
 
 ## LiveKit usage
 
@@ -285,106 +323,40 @@ const livekitRoom = new Room();
 await livekitRoom.connect(import.meta.env.VITE_LIVEKIT_URL, token);
 ```
 
-The LiveKit URL is separate from the backend URL. For example:
-
-```env
-VITE_LIVEKIT_URL=wss://your-project.livekit.cloud
-```
-
-This backend currently streams MP3 over HTTP. It does not publish the generated MP3 into LiveKit by itself. To send TTS audio through LiveKit, a LiveKit publishing participant must connect to the room and publish audio frames. The `/token` endpoint provides the permissions needed for that participant or a frontend publisher.
+This backend streams MP3 over HTTP. It does not publish the generated MP3 into LiveKit by itself. To send TTS audio through LiveKit, a LiveKit publishing participant must connect to the room and publish audio frames.
 
 ## Measuring latency
-
-Measure time to first byte and total request time with `curl`:
 
 ```bash
 curl -N \
   -w "\nHTTP: %{http_code}\nTTFB: %{time_starttransfer}s\nTotal: %{time_total}s\nBytes: %{size_download}\n" \
   -H "Content-Type: application/json" \
-  -d '{"text":"Hello from React"}' \
+  -d '{"text":"First sentence. Second sentence. Third sentence."}' \
   http://127.0.0.1:7878/speak \
   -o output.mp3
 ```
 
-Important measurements:
+With 3 chunks and a TTS provider that takes 3 seconds per chunk:
 
-- **TTFB**: time until the first response bytes arrive. This includes the Rust server request and the TTS provider's initial response delay.
-- **Total**: time until the complete MP3 is received.
-- **Bytes**: size of the returned MP3 file.
-
-A `502` response means the Rust server was reachable, but the TTS provider failed or returned a response that was not MP3 audio.
-
-## Troubleshooting
-
-### `curl: Failed to connect to 127.0.0.1:7878`
-
-The server is not running or is listening on another address.
-
-Start it with:
-
-```bash
-cargo run
-```
-
-Check that it prints:
-
-```text
-TTS server listening on http://127.0.0.1:7878
-```
-
-### `TTS_URL is not configured`
-
-Set the variable before starting the server:
-
-```bash
-export TTS_URL=https://your-tts-provider.example/synthesize
-cargo run
-```
-
-### `TTS provider must return MP3 audio`
-
-Inspect the provider response headers. It must return `audio/mpeg` or `audio/mp3`.
-
-### `/speak` returns `502 Bad Gateway`
-
-Test the TTS provider directly:
-
-```bash
-curl -v \
-  -H "Content-Type: application/json" \
-  -d '{"text":"test"}' \
-  "$TTS_URL" \
-  -o provider-output.mp3
-```
-
-Confirm that:
-
-- The URL is correct.
-- The provider is reachable.
-- Any required provider API key is configured in the provider request.
-- The response status is successful.
-- The response content type is `audio/mpeg` or `audio/mp3`.
+| Mode | Total time |
+|---|---|
+| Sequential (old) | ~9 s (`3 + 3 + 3`) |
+| Parallel (new, 3 workers) | ~3 s (`max(3, 3, 3)`) |
 
 ## Development checks
-
-Run formatting and compilation checks:
 
 ```bash
 cargo fmt -- --check
 cargo check
-```
-
-Run the server:
-
-```bash
+cargo test
 cargo run
 ```
 
 ## Security notes
 
 - Do not expose `LIVEKIT_API_SECRET` to React or browser code.
-- Add authentication before exposing `/speak` publicly.
+- Add authentication before exposing `/speak` or `/chat` publicly.
 - Add request size limits before deploying to production.
 - Restrict CORS from `*` to your real frontend origin in production.
-- Add rate limiting to prevent TTS provider abuse and unexpected costs.
+- Add rate limiting to prevent TTS/LLM provider abuse and unexpected costs.
 - Use HTTPS in production.
